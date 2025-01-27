@@ -1,2 +1,2 @@
 # Python
-This repository all about learning python and to create hands on project on it.
+This repository all about learning python and to creating hands on project on it.
