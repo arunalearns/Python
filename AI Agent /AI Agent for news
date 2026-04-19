@@ -1,1 +1,263 @@
+import re
+import time
+import feedparser
+import requests
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from datetime import datetime
 
+# ==============================
+# CONFIG
+# ==============================
+
+HF_TOKEN       = "HF_TOKEN"   # free token from huggingface.co
+SENDER_EMAIL   = "XXXXXXXX@gmail.com"
+APP_PASSWORD   = "XXXX XXXX XXXX XXXX" # APP Password from gmail
+RECEIVER_EMAIL = "xxxxxxxxx@gmail.com"
+
+# Free HuggingFace summarization model
+API_URL = "https://router.huggingface.co/hf-inference/models/facebook/bart-large-cnn"
+
+HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"}
+
+# ==============================
+# NEWS SOURCES (RSS)
+# ==============================
+
+RSS_FEEDS = {
+    "World":    "https://feeds.bbci.co.uk/news/world/rss.xml",
+    "Business": "https://feeds.bbci.co.uk/news/business/rss.xml",
+    "Tech":     "https://feeds.bbci.co.uk/news/technology/rss.xml",
+    "Science":  "https://feeds.bbci.co.uk/news/science_and_environment/rss.xml",
+    "Politics": "https://feeds.bbci.co.uk/news/politics/rss.xml",
+}
+
+# Keywords that flag a story as BREAKING NEWS
+BREAKING_KEYWORDS = [
+    "breaking", "urgent", "alert", "just in",
+    "developing", "emergency", "crisis", "attack",
+    "explosion", "crash", "killed", "dead", "war"
+]
+
+# ==============================
+# STEP 1 — COLLECT NEWS
+# ==============================
+
+def collect_news() -> list[dict]:
+    """Pull top headlines from all RSS feeds."""
+    articles = []
+    seen_titles = set()
+
+    for category, url in RSS_FEEDS.items():
+        feed = feedparser.parse(url)
+
+        for entry in feed.entries[:5]:
+            title   = entry.get("title",   "").strip()
+            summary = entry.get("summary", "").strip()
+            summary = re.sub(r"<[^>]+>", "", summary)   # strip HTML tags
+
+            # skip duplicates
+            if not title or title.lower() in seen_titles:
+                continue
+            seen_titles.add(title.lower())
+
+            # detect breaking news
+            combined  = (title + " " + summary).lower()
+            is_breaking = any(kw in combined for kw in BREAKING_KEYWORDS)
+
+            articles.append({
+                "category":    category,
+                "title":       title,
+                "summary":     summary,
+                "is_breaking": is_breaking
+            })
+
+    return articles
+
+
+# ==============================
+# STEP 2 — FILTER TOP STORIES
+# ==============================
+
+def filter_top_stories(articles: list[dict], max_stories: int = 8) -> list[dict]:
+    """
+    Simple priority filter:
+    - Breaking news always comes first
+    - Then distribute evenly across categories
+    - Cap at max_stories
+    """
+    breaking = [a for a in articles if a["is_breaking"]]
+    normal   = [a for a in articles if not a["is_breaking"]]
+
+    # one story per category for normal news (avoids one topic dominating)
+    seen_categories = set()
+    filtered_normal = []
+    for article in normal:
+        if article["category"] not in seen_categories:
+            filtered_normal.append(article)
+            seen_categories.add(article["category"])
+
+    top = breaking + filtered_normal
+    return top[:max_stories]
+
+
+# ==============================
+# STEP 3 — SUMMARIZE WITH HF API
+# ==============================
+
+def summarize_text(text: str, retries: int = 3) -> str:
+    """Call free HuggingFace BART model to summarize a news story."""
+    # BART works best with 60–1024 tokens
+    clean_text = text[:1000]
+
+    payload = {
+        "inputs": clean_text,
+        "parameters": {
+            "max_length":  80,
+            "min_length":  30,
+            "do_sample":   False
+        }
+    }
+
+    for attempt in range(retries):
+        response = requests.post(API_URL, headers=HEADERS, json=payload, timeout=30)
+
+        # model is loading — wait and retry
+        if response.status_code == 503:
+            wait = int(response.headers.get("X-WaitFor", 20))
+            print(f"   ⏳ Model loading, waiting {wait}s...")
+            time.sleep(wait)
+            continue
+
+        if response.status_code == 200:
+            result = response.json()
+            if isinstance(result, list) and result:
+                return result[0].get("summary_text", clean_text[:200])
+
+        print(f"   ⚠️  HF API error {response.status_code}: {response.text[:100]}")
+        break
+
+    # fallback: return first 200 chars of original
+    return clean_text[:200] + "..."
+
+
+# ==============================
+# STEP 4 — BUILD BRIEFING
+# ==============================
+
+def build_briefing(top_stories: list[dict]) -> str:
+    """Summarize each story and assemble the daily briefing."""
+    today   = datetime.now().strftime("%A, %B %d, %Y")
+    lines   = []
+
+    lines.append(f"DAILY TOP NEWS SUMMARY — {today}")
+    lines.append("=" * 55)
+    lines.append("")
+
+    if not top_stories:
+        lines.append("No significant global updates today.")
+        return "\n".join(lines)
+
+    for i, article in enumerate(top_stories, start=1):
+        # build input text for summarizer
+        input_text = article["title"] + ". " + article["summary"]
+
+        print(f"   Summarizing story {i}/{len(top_stories)}: {article['title'][:60]}...")
+        ai_summary = summarize_text(input_text)
+
+        # headline label
+        prefix = "🔴 BREAKING NEWS" if article["is_breaking"] else f"[{article['category']}]"
+
+        lines.append(f"{i}. {prefix}")
+        lines.append(f"   {article['title']}")
+        lines.append(f"   {ai_summary}")
+        lines.append("")
+
+    lines.append("=" * 55)
+    lines.append("Sources: BBC News  |  Summarized by AI News Agent (HuggingFace BART)")
+    return "\n".join(lines)
+
+
+# ==============================
+# STEP 5 — SEND EMAIL
+# ==============================
+
+def send_email(briefing: str) -> None:
+    today   = datetime.now().strftime("%B %d, %Y")
+    subject = f"📰 Daily Top News Summary — {today}"
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"]    = SENDER_EMAIL
+    msg["To"]      = RECEIVER_EMAIL
+
+    # plain text
+    text_part = MIMEText(briefing, "plain")
+
+    # HTML version — nicer in email clients
+    html_lines = []
+    for line in briefing.split("\n"):
+        if line.startswith("DAILY TOP NEWS"):
+            html_lines.append(f'<h2 style="color:#c0392b;">{line}</h2>')
+        elif line.startswith("="):
+            html_lines.append("<hr>")
+        elif line.strip().startswith(("1.", "2.", "3.", "4.", "5.",
+                                      "6.", "7.", "8.", "9.", "10.")):
+            html_lines.append(f'<p><strong>{line.strip()}</strong></p>')
+        elif line.strip().startswith("🔴"):
+            html_lines.append(f'<p style="color:red;"><strong>{line.strip()}</strong></p>')
+        elif line.strip():
+            html_lines.append(f'<p style="margin:4px 0;">{line.strip()}</p>')
+
+    html_body = "\n".join(html_lines)
+    html_part = MIMEText(
+        f"""
+        <html>
+        <body style="font-family:Arial,sans-serif;max-width:680px;
+                     margin:auto;padding:24px;color:#222;">
+          {html_body}
+          <br>
+          <p style="font-size:11px;color:#999;">
+            Powered by AI News Agent &bull; Free HuggingFace BART Model
+          </p>
+        </body>
+        </html>
+        """,
+        "html"
+    )
+
+    msg.attach(text_part)
+    msg.attach(html_part)
+
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        server.login(SENDER_EMAIL, APP_PASSWORD)
+        server.send_message(msg)
+
+    print("✅ Email sent successfully!")
+
+
+# ==============================
+# MAIN
+# ==============================
+
+def main():
+    print("📡 Step 1: Collecting news from RSS feeds...")
+    articles = collect_news()
+    print(f"   Collected {len(articles)} articles.")
+
+    print("🔍 Step 2: Filtering top stories...")
+    top_stories = filter_top_stories(articles, max_stories=8)
+    print(f"   Selected {len(top_stories)} top stories.")
+
+    print("🤖 Step 3 & 4: Summarizing and building briefing...")
+    briefing = build_briefing(top_stories)
+
+    print("\n" + briefing + "\n")
+
+    print("📧 Step 5: Sending email...")
+    send_email(briefing)
+
+
+if __name__ == "__main__":
+    main()
